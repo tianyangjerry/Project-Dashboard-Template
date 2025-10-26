@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"ts":{"$numberInt":"1"}},"name":"ts_1"},{"v":{"$numberInt":"2"},"key":{"meta.profile_id":{"$numberInt":"1"}},"name":"meta.profile_id_1"}],"uuid":"a53c9de3123848f2a93fdc700cdf3a47","collectionName":"ab_exposure_ts","type":"collection"}

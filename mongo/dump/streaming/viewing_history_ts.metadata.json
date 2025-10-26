@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"ts":{"$numberInt":"1"}},"name":"ts_1"},{"v":{"$numberInt":"2"},"key":{"meta.profile_id":{"$numberInt":"1"}},"name":"meta.profile_id_1"}],"uuid":"60ec64941fc54e3ca349f3a0bb136c04","collectionName":"viewing_history_ts","type":"collection"}
