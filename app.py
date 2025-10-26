@@ -10,360 +10,401 @@ from pymongo import MongoClient
 
 load_dotenv()
 
-#Postgres schema helper
-PG_SCHEMA = os.getenv("PG_SCHEMA", "public")   # CHANGE: "public" to your own schema name
+# Postgres schema helper
+PG_SCHEMA = os.getenv("PG_SCHEMA", "public")  # CHANGE: "public" to your own schema name
+
+
 def qualify(sql: str) -> str:
     # Replace occurrences of {S}.<table> with <schema>.<table>
     return sql.replace("{S}.", f"{PG_SCHEMA}.")
+
 
 # CONFIG: Postgres and Mongo Queries
 CONFIG = {
     "postgres": {
         "enabled": True,
-        "uri": os.getenv("PG_URI", "postgresql+psycopg2://postgres:password@localhost:5432/postgres"),  # Will read from your .env file
+        "uri": os.getenv("PG_URI", "postgresql+psycopg2://postgres:postgres@localhost:5432/streaming_db"),
         "queries": {
-            #CHANGE: Replace all the following Postgres queries with your own queries, for each user you identified for your project's Information System
-            # Each query must have a unique name, an SQL string, a chart specification, tags (for user roles), and optional params (parameters)
-            # :doctor_id, :nurse_id, :patient_name, etc., are placeholders. Their values will come from the dashboard sidebar.
-            #User 1: DOCTORS 
-            "Doctor: patients under my care (table)": {
+            # ===== Viewer =====
+            "Viewer: my watchlist (table)": {
                 "sql": """
-                    SELECT p.patient_id, p.name AS patient, p.age, p.room_no
-                    FROM {S}.patients p
-                    WHERE p.doctor_id = :doctor_id 
-                    ORDER BY p.name;
-                """,
+                       SELECT w.added_at, c.content_id, c.title, c.content_type
+                       FROM {S}.watchlist w
+            JOIN {S}.content   c
+                       ON c.content_id = w.content_id
+                       WHERE w.profile_id = :profile_id
+                       ORDER BY w.added_at DESC
+                           LIMIT 200;
+                       """,
                 "chart": {"type": "table"},
-                "tags": ["doctor"],
-                "params": ["doctor_id"]
+                "tags": ["viewer"],
+                "params": ["profile_id"]
             },
-            "Doctor: most recent treatment per my patient (table)": {
+            "Viewer: my ratings in last N days (table)": {
                 "sql": """
-                    SELECT p.name AS patient,
-                           (SELECT MAX(t.treatment_time)
-                              FROM {S}.treatments t
-                              WHERE t.patient_id = p.patient_id) AS last_treatment
-                    FROM {S}.patients p
-                    WHERE p.doctor_id = :doctor_id
-                    ORDER BY last_treatment DESC NULLS LAST;
-                """,
+                       SELECT r.created_at, c.title, r.stars, r.comment
+                       FROM {S}.ratings r
+            JOIN {S}.content c
+                       ON c.content_id = r.content_id
+                       WHERE r.profile_id = :profile_id
+                         AND r.created_at >= NOW() - (:since_days || ' days'):: interval
+                       ORDER BY r.created_at DESC
+                           LIMIT 200;
+                       """,
                 "chart": {"type": "table"},
-                "tags": ["doctor"],
-                "params": ["doctor_id"]
+                "tags": ["viewer"],
+                "params": ["profile_id", "since_days"]
             },
-            "Doctor: high-risk (age > threshold) under my care (bar)": {
+            "Viewer: rating histogram last N days (bar)": {
                 "sql": """
-                    SELECT p.name AS patient, p.age
-                    FROM {S}.patients p
-                    WHERE p.doctor_id = :doctor_id
-                      AND p.age > :age_threshold
-                    ORDER BY p.age DESC;
-                """,
-                "chart": {"type": "bar", "x": "patient", "y": "age"},
-                "tags": ["doctor"],
-                "params": ["doctor_id", "age_threshold"]
+                       SELECT r.stars, COUNT(*) ::int AS cnt
+                       FROM {S}.ratings r
+                       WHERE r.profile_id = :profile_id
+                         AND r.created_at >= NOW() - (:since_days || ' days'):: interval
+                       GROUP BY r.stars
+                       ORDER BY r.stars;
+                       """,
+                "chart": {"type": "bar", "x": "stars", "y": "cnt"},
+                "tags": ["viewer"],
+                "params": ["profile_id", "since_days"]
             },
-            "Doctor: patients with NO treatment today (table)": {
+            "Viewer: my avg stars by genre (bar)": {
                 "sql": """
-                    SELECT p.name, p.room_no
-                    FROM {S}.patients p
-                    WHERE p.doctor_id = :doctor_id
-                      AND NOT EXISTS (
-                        SELECT 1
-                        FROM {S}.treatments t
-                        WHERE t.patient_id = p.patient_id
-                          AND t.treatment_time::date = CURRENT_DATE
-                      );
-                """,
-                "chart": {"type": "table"},
-                "tags": ["doctor"],
-                "params": ["doctor_id"]
-            },
-            "Doctor: treatments by type for my patients (bar)": {
-                "sql": """
-                    SELECT t.treatment_type, COUNT(*)::int AS times_given
-                    FROM {S}.treatments t
-                    JOIN {S}.patients p ON p.patient_id = t.patient_id
-                    WHERE p.doctor_id = :doctor_id
-                    GROUP BY t.treatment_type
-                    ORDER BY times_given DESC;
-                """,
-                "chart": {"type": "bar", "x": "treatment_type", "y": "times_given"},
-                "tags": ["doctor"],
-                "params": ["doctor_id"]
+                       SELECT g.name                          AS genre,
+                              ROUND(AVG(r.stars)::numeric, 2) AS avg_stars,
+                              COUNT(*) ::int AS n
+                       FROM {S}.ratings r
+            JOIN {S}.content_genres cg
+                       ON cg.content_id = r.content_id
+                           JOIN {S}.genres g ON g.genre_id = cg.genre_id
+                       WHERE r.profile_id = :profile_id
+                       GROUP BY g.name
+                       HAVING COUNT (*) >= 2
+                       ORDER BY avg_stars DESC
+                           LIMIT 20;
+                       """,
+                "chart": {"type": "bar", "x": "genre", "y": "avg_stars"},
+                "tags": ["viewer"],
+                "params": ["profile_id"]
             },
 
-            #User 2: NURSES 
-            "Nurse: today’s tasks (treatments to administer) (table)": {
+            # ===== Support =====
+            "Support: user overview (table)": {
                 "sql": """
-                    SELECT p.name AS patient, t.treatment_type, t.treatment_time
-                    FROM {S}.treatments t
-                    JOIN {S}.patients p ON t.patient_id = p.patient_id
-                    WHERE t.nurse_id = :nurse_id
-                      AND t.treatment_time::date = CURRENT_DATE
-                    ORDER BY t.treatment_time;
-                """,
+                       SELECT u.user_id,
+                              u.email,
+                              u.country_code,
+                              u.is_active,
+                              u.created_at,
+                              COALESCE(sub.status, 'none') AS active_sub_status,
+                              COALESCE(pl.name, '')        AS active_plan,
+                              COALESCE(pz.pcnt, 0)         AS profiles,
+                              COALESCE(dz.dcnt, 0)         AS devices
+                       FROM {S}.users u
+            LEFT JOIN LATERAL (
+                SELECT s.status, s.plan_id
+                FROM {S}.subscriptions s
+                WHERE s.user_id = u.user_id AND s.status = 'active'
+                ORDER BY s.start_at DESC
+                LIMIT 1
+            ) sub
+                       ON TRUE
+                           LEFT JOIN {S}.plans pl ON pl.plan_id = sub.plan_id
+                           LEFT JOIN LATERAL (
+                           SELECT COUNT (*):: int AS pcnt FROM {S}.profiles p WHERE p.user_id = u.user_id
+                           ) pz ON TRUE
+                           LEFT JOIN LATERAL (
+                           SELECT COUNT (*):: int AS dcnt FROM {S}.devices d WHERE d.user_id = u.user_id
+                           ) dz ON TRUE
+                       WHERE u.user_id = :user_id;
+                       """,
                 "chart": {"type": "table"},
-                "tags": ["nurse"],
-                "params": ["nurse_id"]
+                "tags": ["support"],
+                "params": ["user_id"]
             },
-            "Nurse: patients with NO treatment yet today (table)": {
+            "Support: profiles by user (table)": {
                 "sql": """
-                    SELECT p.name, p.room_no
-                    FROM {S}.patients p
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM {S}.treatments t
-                        WHERE t.patient_id = p.patient_id
-                          AND t.treatment_time::date = CURRENT_DATE
-                    )
-                    ORDER BY p.room_no, p.name;
-                """,
+                       SELECT profile_id, name, maturity_rating, preferred_lang, created_at
+                       FROM {S}.profiles
+                       WHERE user_id = :user_id
+                       ORDER BY created_at DESC;
+                       """,
                 "chart": {"type": "table"},
-                "tags": ["nurse"]
+                "tags": ["support"],
+                "params": ["user_id"]
             },
-            "Nurse: medicines running low (bar)": {
+            "Support: devices by user (table)": {
                 "sql": """
-                    SELECT m.name, m.quantity
-                    FROM {S}.medicine_stock m
-                    WHERE m.quantity < :med_low_threshold
-                    ORDER BY m.quantity ASC;
-                """,
-                "chart": {"type": "bar", "x": "name", "y": "quantity"},
-                "tags": ["nurse"],
-                "params": ["med_low_threshold"]
+                       SELECT device_id, device_type, app_version, last_seen_at
+                       FROM {S}.devices
+                       WHERE user_id = :user_id
+                       ORDER BY last_seen_at DESC NULLS LAST;
+                       """,
+                "chart": {"type": "table"},
+                "tags": ["support"],
+                "params": ["user_id"]
+            },
+            "Support: subscription history (table)": {
+                "sql": """
+                       SELECT s.plan_id, pl.name AS plan_name, s.status, s.start_at, s.end_at
+                       FROM {S}.subscriptions s
+            LEFT JOIN {S}.plans pl
+                       ON pl.plan_id = s.plan_id
+                       WHERE s.user_id = :user_id
+                       ORDER BY s.start_at DESC;
+                       """,
+                "chart": {"type": "table"},
+                "tags": ["support"],
+                "params": ["user_id"]
             },
 
-            #User 3: PHARMACISTS 
-            "Pharmacist: medicines to reorder (bar)": {
+            # ===== Content Ops =====
+            "Content Ops: watchlist adds last N days (bar)": {
                 "sql": """
-                    SELECT m.name, m.quantity
-                    FROM {S}.medicine_stock m
-                    WHERE m.quantity < :reorder_threshold
-                    ORDER BY m.quantity ASC;
-                """,
-                "chart": {"type": "bar", "x": "name", "y": "quantity"},
-                "tags": ["pharmacist"],
-                "params": ["reorder_threshold"]
+                       SELECT c.title, COUNT(*) ::int AS adds
+                       FROM {S}.watchlist w
+            JOIN {S}.content c
+                       ON c.content_id = w.content_id
+                       WHERE w.added_at >= NOW() - (:since_days || ' days'):: interval
+                       GROUP BY c.title
+                       ORDER BY adds DESC
+                           LIMIT 20;
+                       """,
+                "chart": {"type": "bar", "x": "title", "y": "adds"},
+                "tags": ["content_ops"],
+                "params": ["since_days"]
             },
-            "Pharmacist: top 5 medicines this month (bar)": {
+            "Content Ops: rating distribution for a title (bar)": {
                 "sql": """
-                    SELECT t.treatment_type AS medicine, COUNT(*)::int AS times_given
-                    FROM {S}.treatments t
-                    WHERE t.treatment_time >= date_trunc('month', CURRENT_DATE)
-                    GROUP BY t.treatment_type
-                    ORDER BY times_given DESC
-                    LIMIT 5;
-                """,
-                "chart": {"type": "bar", "x": "medicine", "y": "times_given"},
-                "tags": ["pharmacist"]
+                       SELECT r.stars, COUNT(*) ::int AS cnt
+                       FROM {S}.ratings r
+                       WHERE r.content_id = :content_id
+                       GROUP BY r.stars
+                       ORDER BY r.stars;
+                       """,
+                "chart": {"type": "bar", "x": "stars", "y": "cnt"},
+                "tags": ["content_ops"],
+                "params": ["content_id"]
             },
-            "Pharmacist: which nurse gave most medicines today (table)": {
+            "Content Ops: top genres by avg stars (bar)": {
                 "sql": """
-                    SELECT n.name, COUNT(t.treatment_id)::int AS total
-                    FROM {S}.nurses n
-                    JOIN {S}.treatments t ON t.nurse_id = n.nurse_id
-                    WHERE t.treatment_time::date = CURRENT_DATE
-                    GROUP BY n.name
-                    ORDER BY total DESC
-                    LIMIT 1;
-                """,
-                "chart": {"type": "table"},
-                "tags": ["pharmacist"]
+                       SELECT g.name AS genre, ROUND(AVG(r.stars)::numeric, 2) AS avg_stars
+                       FROM {S}.ratings r
+            JOIN {S}.content_genres cg
+                       ON cg.content_id = r.content_id
+                           JOIN {S}.genres g ON g.genre_id = cg.genre_id
+                       GROUP BY g.name
+                       HAVING COUNT (*) >= 10
+                       ORDER BY avg_stars DESC
+                           LIMIT 15;
+                       """,
+                "chart": {"type": "bar", "x": "genre", "y": "avg_stars"},
+                "tags": ["content_ops"]
             },
-            "Pharmacist: medicines unused in last N days (table)": {
+            "Content Ops: most rated titles last N days (bar)": {
                 "sql": """
-                    SELECT m.name
-                    FROM {S}.medicine_stock m
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM {S}.treatments t
-                        WHERE t.treatment_type = m.name
-                          AND t.treatment_time >= NOW() - (:days || ' days')::interval
-                    )
-                    ORDER BY m.name;
-                """,
-                "chart": {"type": "table"},
-                "tags": ["pharmacist"],
-                "params": ["days"]
+                       SELECT c.title, COUNT(*) ::int AS ratings
+                       FROM {S}.ratings r
+            JOIN {S}.content c
+                       ON c.content_id = r.content_id
+                       WHERE r.created_at >= NOW() - (:since_days || ' days'):: interval
+                       GROUP BY c.title
+                       ORDER BY ratings DESC
+                           LIMIT 20;
+                       """,
+                "chart": {"type": "bar", "x": "title", "y": "ratings"},
+                "tags": ["content_ops"],
+                "params": ["since_days"]
             },
-
-            # User 4: FAMILY/GUARDIANS 
-            "Family: last treatment for my relative (table)": {
+            "Content Ops: playlist adds last N days (bar)": {
                 "sql": """
-                    SELECT t.treatment_type, t.treatment_time, n.name AS nurse
-                    FROM {S}.treatments t
-                    JOIN {S}.patients p ON t.patient_id = p.patient_id
-                    LEFT JOIN {S}.nurses n ON t.nurse_id = n.nurse_id
-                    WHERE p.name = :patient_name
-                    ORDER BY t.treatment_time DESC
-                    LIMIT 1;
-                """,
-                "chart": {"type": "table"},
-                "tags": ["guardian"],
-                "params": ["patient_name"]
-            },
-            "Family: which doctor is assigned to my relative? (table)": {
-                "sql": """
-                    SELECT p.name AS patient, d.name AS doctor, d.specialization
-                    FROM {S}.patients p
-                    JOIN {S}.doctors d ON p.doctor_id = d.doctor_id
-                    WHERE p.name = :patient_name;
-                """,
-                "chart": {"type": "table"},
-                "tags": ["guardian"],
-                "params": ["patient_name"]
-            },
-            "Family: total treatments this month for my relative (table)": {
-                "sql": """
-                    SELECT COUNT(*)::int AS treatments_this_month
-                    FROM {S}.treatments t
-                    JOIN {S}.patients p ON t.patient_id = p.patient_id
-                    WHERE p.name = :patient_name
-                      AND t.treatment_time >= date_trunc('month', CURRENT_DATE);
-                """,
-                "chart": {"type": "table"},
-                "tags": ["guardian"],
-                "params": ["patient_name"]
+                       SELECT c.title, COUNT(*) ::int AS added
+                       FROM {S}.playlist_items pi
+            JOIN {S}.content c
+                       ON c.content_id = pi.content_id
+                       WHERE pi.added_at >= NOW() - (:since_days || ' days'):: interval
+                       GROUP BY c.title
+                       ORDER BY added DESC
+                           LIMIT 20;
+                       """,
+                "chart": {"type": "bar", "x": "title", "y": "added"},
+                "tags": ["content_ops"],
+                "params": ["since_days"]
             },
 
-            # User 5: MANAGERS 
-            "Mgr: total patients & average age (table)": {
+            # ===== Licensing =====
+            "Licensing: deals expiring in next N days (table)": {
                 "sql": """
-                    SELECT COUNT(*)::int AS total_patients, AVG(age)::numeric(10,1) AS avg_age
-                    FROM {S}.patients;
-                """,
+                       SELECT l.license_id, c.title, l.region_code, r.name AS region_name, l.window_end
+                       FROM {S}.license  l
+            JOIN {S}.content  c
+                       ON c.content_id = l.content_id
+                           LEFT JOIN {S}.regions r ON r.region_code = l.region_code
+                       WHERE l.window_end <= NOW() + (:since_days || ' days'):: interval
+                       ORDER BY l.window_end;
+                       """,
                 "chart": {"type": "table"},
-                "tags": ["manager"]
+                "tags": ["licensing"],
+                "params": ["since_days"]
             },
-            "Mgr: patients per doctor (bar)": {
+            "Licensing: active deals by region (bar)": {
                 "sql": """
-                    SELECT d.name AS doctor, COUNT(*)::int AS num_patients
-                    FROM {S}.doctors d
-                    LEFT JOIN {S}.patients p ON d.doctor_id = p.doctor_id
-                    GROUP BY d.name
-                    ORDER BY num_patients DESC;
-                """,
-                "chart": {"type": "bar", "x": "doctor", "y": "num_patients"},
-                "tags": ["manager"]
+                       SELECT l.region_code, COUNT(*) ::int AS active_deals
+                       FROM {S}.license l
+                       WHERE NOW() BETWEEN l.window_start AND l.window_end
+                       GROUP BY l.region_code
+                       ORDER BY active_deals DESC;
+                       """,
+                "chart": {"type": "bar", "x": "region_code", "y": "active_deals"},
+                "tags": ["licensing"]
             },
-            "Mgr: treatments in last N days (table)": {
+            "Licensing: titles with no active deal (table)": {
                 "sql": """
-                    SELECT COUNT(*)::int AS total_treatments
-                    FROM {S}.treatments
-                    WHERE treatment_time >= NOW() - (:days || ' days')::interval;
-                """,
+                       SELECT c.content_id, c.title
+                       FROM {S}.content c
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM {S}.license l
+                           WHERE l.content_id = c.content_id
+                         AND NOW() BETWEEN l.window_start
+                         AND l.window_end
+                           )
+                       ORDER BY c.title;
+                       """,
                 "chart": {"type": "table"},
-                "tags": ["manager"],
-                "params": ["days"]
+                "tags": ["licensing"]
             },
-            "Mgr: rooms currently occupied (table)": {
+            "Licensing: coverage by region for a title (table)": {
                 "sql": """
-                    SELECT DISTINCT p.room_no
-                    FROM {S}.patients p
-                    ORDER BY p.room_no;
-                """,
+                       SELECT l.region_code, r.name AS region_name, l.window_start, l.window_end
+                       FROM {S}.license l
+            LEFT JOIN {S}.regions r
+                       ON r.region_code = l.region_code
+                       WHERE l.content_id = :content_id
+                       ORDER BY l.region_code;
+                       """,
                 "chart": {"type": "table"},
-                "tags": ["manager"]
-            },
-            "Mgr: doctor with oldest patients (table)": {
-                "sql": """
-                    SELECT d.name, MAX(p.age) AS oldest_patient_age
-                    FROM {S}.doctors d
-                    JOIN {S}.patients p ON d.doctor_id = p.doctor_id
-                    GROUP BY d.name
-                    ORDER BY oldest_patient_age DESC
-                    LIMIT 1;
-                """,
-                "chart": {"type": "table"},
-                "tags": ["manager"]
+                "tags": ["licensing"],
+                "params": ["content_id"]
             }
         }
     },
 
     "mongo": {
         "enabled": True,
-        "uri": os.getenv("MONGO_URI", "mongodb://localhost:27017"),  # Will read from the .env file
-        "db_name": os.getenv("MONGO_DB", "eldercare"),               # Will read from the .env file
-        
-        # CHANGE: Just like above, replace all the following Mongo queries with your own, for the different users you identified
+        "uri": os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+        "db_name": os.getenv("MONGO_DB", "streaming"),
         "queries": {
-            "TS: Hourly avg heart rate (resident 501, last 24h)": {
-                "collection": "bracelet_readings_ts",
+            # TS: 播放量（近24h，按小时）
+            "TS: hourly views last 24h (line)": {
+                "collection": "viewing_history_ts",
                 "aggregate": [
-                    {"$match": {
-                        "meta.resident_id": 501,
-                        "ts": {"$gte": dt.datetime.utcnow() - dt.timedelta(hours=24)}
-                    }},
-                    {"$project": {
-                        "hour": {"$dateTrunc": {"date": "$ts", "unit": "hour"}},
-                        "hr": "$heart_rate_bpm"
-                    }},
-                    {"$group": {"_id": "$hour", "avg_hr": {"$avg": "$hr"}, "n": {"$count": {}}}},
+                    {"$match": {"ts": {"$gte": dt.datetime.utcnow() - dt.timedelta(hours=24)}}},
+                    {"$project": {"hour": {"$dateTrunc": {"date": "$ts", "unit": "hour"}}}},
+                    {"$group": {"_id": "$hour", "views": {"$count": {}}}},
                     {"$sort": {"_id": 1}}
                 ],
-                "chart": {"type": "line", "x": "_id", "y": "avg_hr"}
+                "chart": {"type": "line", "x": "_id", "y": "views"}
             },
 
-            "TS: Exceedance counts (SpO2 < 92, last 7 days) by resident": {
-                "collection": "bracelet_readings_ts",
+            # TS: 去重观众数（近24h，按小时）
+            "TS: hourly unique viewers last 24h (line)": {
+                "collection": "viewing_history_ts",
                 "aggregate": [
-                    {"$match": {
-                        "ts": {"$gte": dt.datetime.utcnow() - dt.timedelta(days=7)},
-                        "spo2_pct": {"$lt": 92}
+                    {"$match": {"ts": {"$gte": dt.datetime.utcnow() - dt.timedelta(hours=24)}}},
+                    {"$project": {
+                        "hour": {"$dateTrunc": {"date": "$ts", "unit": "hour"}},
+                        "pid": "$meta.profile_id"
                     }},
-                    {"$group": {"_id": "$meta.resident_id", "hits": {"$count": {}}}},
-                    {"$sort": {"hits": -1}}
+                    {"$group": {"_id": "$hour", "uniq": {"$addToSet": "$pid"}}},
+                    {"$project": {"unique_viewers": {"$size": "$uniq"}}},
+                    {"$sort": {"_id": 1}}
                 ],
-                "chart": {"type": "bar", "x": "_id", "y": "hits"}
+                "chart": {"type": "line", "x": "_id", "y": "unique_viewers"}
             },
 
-            "Telemetry: Latest reading per device": {
-                "collection": "bracelet_data",
+            # AB：近7天各 variant 曝光量
+            "AB: exposure counts last 7d by variant (bar)": {
+                "collection": "ab_exposure_ts",
+                "aggregate": [
+                    {"$match": {"ts": {"$gte": dt.datetime.utcnow() - dt.timedelta(days=7)}}},
+                    {"$group": {"_id": "$variant", "exposures": {"$count": {}}}},
+                    {"$sort": {"exposures": -1}}
+                ],
+                "chart": {"type": "bar", "x": "_id", "y": "exposures"}
+            },
+
+            # AB：暴露后24h观看量闭环
+            "TS: A/B exposure → views in 24h by variant (bar)": {
+                "collection": "ab_exposure_ts",
+                "aggregate": [
+                    {"$match": {"ts": {"$gte": dt.datetime.utcnow() - dt.timedelta(days=7)}}},
+                    {"$project": {"profile_id": "$meta.profile_id", "variant": 1, "t0": "$ts"}},
+                    {"$lookup": {
+                        "from": "viewing_history_ts",
+                        "let": {"pid": "$profile_id", "t0": "$t0"},
+                        "pipeline": [
+                            {"$match": {"$expr": {"$and": [
+                                {"$eq": ["$meta.profile_id", "$$pid"]},
+                                {"$gte": ["$ts", "$$t0"]},
+                                {"$lte": ["$ts", {"$add": ["$$t0", 24 * 3600 * 1000]}]}
+                            ]}}},
+                            {"$project": {"_id": 1}}
+                        ],
+                        "as": "post_views"
+                    }},
+                    {"$project": {"variant": 1, "views_24h": {"$size": "$post_views"}}},
+                    {"$group": {"_id": "$variant", "total_views_24h": {"$sum": "$views_24h"}}},
+                    {"$sort": {"total_views_24h": -1}}
+                ],
+                "chart": {"type": "bar", "x": "_id", "y": "total_views_24h"}
+            },
+
+            # Telemetry：每个 profile 最近一次播放
+            "Telemetry: latest playback per profile (table)": {
+                "collection": "viewing_history_ts",
                 "aggregate": [
                     {"$sort": {"ts": -1, "_id": -1}},
-                    {"$group": {"_id": "$device_id", "doc": {"$first": "$$ROOT"}}},
+                    {"$group": {"_id": "$meta.profile_id", "doc": {"$first": "$$ROOT"}}},
                     {"$replaceRoot": {"newRoot": "$doc"}},
                     {"$project": {
-                        "_id": 0, "device_id": 1, "resident_id": 1, "ts": 1,
-                        "hr": "$metrics.heart_rate_bpm", "spo2": "$metrics.spo2_pct",
-                        "status": 1
+                        "_id": 0,
+                        "profile_id": "$meta.profile_id",
+                        "content_id": 1,
+                        "ts": 1,
+                        "device": "$meta.device_id"
                     }}
                 ],
                 "chart": {"type": "table"}
             },
 
-            "Telemetry: Battery status distribution": {
-                "collection": "bracelet_data",
+            # Telemetry：每个 device 最近一次播放
+            "Telemetry: latest playback per device (table)": {
+                "collection": "viewing_history_ts",
                 "aggregate": [
+                    {"$sort": {"ts": -1, "_id": -1}},
+                    {"$group": {"_id": "$meta.device_id", "doc": {"$first": "$$ROOT"}}},
+                    {"$replaceRoot": {"newRoot": "$doc"}},
                     {"$project": {
-                        "battery": {"$ifNull": ["$battery_pct", None]},
-                        "bucket": {
-                            "$switch": {
-                                "branches": [
-                                    {"case": {"$gte": ["$battery_pct", 80]}, "then": "80–100"},
-                                    {"case": {"$gte": ["$battery_pct", 60]}, "then": "60–79"},
-                                    {"case": {"$gte": ["$battery_pct", 40]}, "then": "40–59"},
-                                    {"case": {"$gte": ["$battery_pct", 20]}, "then": "20–39"},
-                                ],
-                                "default": "<20 or null"
-                            }
-                        }
-                    }},
-                    {"$group": {"_id": "$bucket", "cnt": {"$count": {}}}},
-                    {"$sort": {"cnt": -1}}
+                        "_id": 0,
+                        "device_id": "$meta.device_id",
+                        "profile_id": "$meta.profile_id",
+                        "content_id": 1,
+                        "ts": 1
+                    }}
                 ],
-                "chart": {"type": "pie", "names": "_id", "values": "cnt"}
+                "chart": {"type": "table"}
             },
 
-            "TS Treemap: readings count by resident and device (last 24h)": {
-                "collection": "bracelet_readings_ts",
+            # Telemetry：近24h 观看最多的设备 Top10
+            "Telemetry: top devices by views (24h) (bar)": {
+                "collection": "viewing_history_ts",
                 "aggregate": [
                     {"$match": {"ts": {"$gte": dt.datetime.utcnow() - dt.timedelta(hours=24)}}},
-                    {"$group": {"_id": {"resident": "$meta.resident_id", "device": "$meta.device_id"}, "cnt": {"$count": {}}}},
-                    {"$project": {"resident": "$_id.resident", "device": "$_id.device", "cnt": 1, "_id": 0}}
+                    {"$group": {"_id": "$meta.device_id", "views": {"$count": {}}}},
+                    {"$sort": {"views": -1}},
+                    {"$limit": 10}
                 ],
-                "chart": {"type": "treemap", "path": ["resident", "device"], "values": "cnt"}
+                "chart": {"type": "bar", "x": "_id", "y": "views"}
             }
         }
     }
@@ -373,23 +414,28 @@ CONFIG = {
 st.set_page_config(page_title="Old-Age Home DB Dashboard", layout="wide")
 st.title("Old-Age Home | Mini Dashboard (Postgres + MongoDB)")
 
+
 def metric_row(metrics: dict):
     cols = st.columns(len(metrics))
     for (k, v), c in zip(metrics.items(), cols):
         c.metric(k, v)
 
+
 @st.cache_resource
 def get_pg_engine(uri: str):
     return create_engine(uri, pool_pre_ping=True, future=True)
+
 
 @st.cache_data(ttl=60)
 def run_pg_query(_engine, sql: str, params: dict | None = None):
     with _engine.connect() as conn:
         return pd.read_sql(text(sql), conn, params=params or {})
 
+
 @st.cache_resource
 def get_mongo_client(uri: str):
     return MongoClient(uri)
+
 
 def mongo_overview(client: MongoClient, db_name: str):
     info = client.server_info()
@@ -401,15 +447,17 @@ def mongo_overview(client: MongoClient, db_name: str):
         "DB": db_name,
         "Collections": f"{len(colls):,}",
         "Total docs (est.)": f"{total_docs:,}",
-        "Storage": f"{round(stats.get('storageSize',0)/1024/1024,1)} MB",
+        "Storage": f"{round(stats.get('storageSize', 0) / 1024 / 1024, 1)} MB",
         "Version": info.get("version", "unknown")
     }
+
 
 @st.cache_data(ttl=60)
 def run_mongo_aggregate(_client, db_name: str, coll: str, stages: list):
     db = _client[db_name]
     docs = list(db[coll].aggregate(stages, allowDiskUse=True))
     return pd.json_normalize(docs) if docs else pd.DataFrame()
+
 
 def render_chart(df: pd.DataFrame, spec: dict):
     if df.empty:
@@ -442,41 +490,36 @@ def render_chart(df: pd.DataFrame, spec: dict):
     else:
         st.dataframe(df, use_container_width=True)
 
+
 # The following block of code is for the dashboard sidebar, where you can pick your users, provide parameters, etc.
 with st.sidebar:
     st.header("Connections")
-    # These fields are pre-filled from .env file
-    pg_uri = st.text_input("Postgres URI", CONFIG["postgres"]["uri"])     
-    mongo_uri = st.text_input("Mongo URI", CONFIG["mongo"]["uri"])        
-    mongo_db = st.text_input("Mongo DB name", CONFIG["mongo"]["db_name"]) 
+    pg_uri = st.text_input("Postgres URI", CONFIG["postgres"]["uri"])
+    mongo_uri = st.text_input("Mongo URI", CONFIG["mongo"]["uri"])
+    mongo_db = st.text_input("Mongo DB name", CONFIG["mongo"]["db_name"])
     st.divider()
     auto_run = st.checkbox("Auto-run on selection change", value=False, key="auto_run_global")
 
     st.header("Role & Parameters")
-    # CHANGE: Change the different roles, the specific attributes, parameters used, etc., to match your own Information System
-    role = st.selectbox("User role", ["doctor","nurse","pharmacist","guardian","manager","all"], index=5)
-    doctor_id = st.number_input("doctor_id", min_value=1, value=1, step=1)
-    nurse_id = st.number_input("nurse_id", min_value=1, value=2, step=1)
-    patient_name = st.text_input("patient_name", value="Alice")
-    age_threshold = st.number_input("age_threshold", min_value=0, value=85, step=1)
-    days = st.slider("last N days", 1, 90, 7)
-    med_low_threshold = st.number_input("med_low_threshold", min_value=0, value=5, step=1)
-    reorder_threshold = st.number_input("reorder_threshold", min_value=0, value=10, step=1)
+    role = st.selectbox("User role", ["viewer", "support", "content_ops", "licensing", "all"], index=4)
+
+    profile_id = st.text_input("profile_id (UUID)", value="")
+    user_id    = st.text_input("user_id (UUID)",    value="")
+    content_id = st.text_input("content_id (UUID)", value="")
+    since_days = st.slider("last N days", 1, 90, 7)
 
     PARAMS_CTX = {
-        "doctor_id": int(doctor_id),
-        "nurse_id": int(nurse_id),
-        "patient_name": patient_name,
-        "age_threshold": int(age_threshold),
-        "days": int(days),
-        "med_low_threshold": int(med_low_threshold),
-        "reorder_threshold": int(reorder_threshold),
+        "profile_id": profile_id.strip(),
+        "user_id":    user_id.strip(),
+        "content_id": content_id.strip(),
+        "since_days": int(since_days),
     }
 
-#Postgres part of the dashboard
+
+# Postgres part of the dashboard
 st.subheader("Postgres")
 try:
-    
+
     eng = get_pg_engine(pg_uri)
 
     with st.expander("Run Postgres query", expanded=True):
@@ -485,7 +528,9 @@ try:
             def ok(tags):
                 t = [s.lower() for s in (tags or ["all"])]
                 return "all" in t or role.lower() in t
+
             return {name: q for name, q in qdict.items() if ok(q.get("tags"))}
+
 
         pg_all = CONFIG["postgres"]["queries"]
         pg_q = filter_queries_by_role(pg_all, role)
@@ -495,10 +540,10 @@ try:
 
         if sel in pg_q:
             q = pg_q[sel]
-            sql = qualify(q["sql"])   
+            sql = qualify(q["sql"])
             st.code(sql, language="sql")
 
-            run  = auto_run or st.button("▶ Run Postgres", key="pg_run")
+            run = auto_run or st.button("▶ Run Postgres", key="pg_run")
             if run:
                 wanted = q.get("params", [])
                 params = {k: PARAMS_CTX[k] for k in wanted}
@@ -513,7 +558,7 @@ except Exception as e:
 if CONFIG["mongo"]["enabled"]:
     st.subheader("🍃 MongoDB")
     try:
-        mongo_client = get_mongo_client(mongo_uri)   
+        mongo_client = get_mongo_client(mongo_uri)
         metric_row(mongo_overview(mongo_client, mongo_db))
 
         with st.expander("Run Mongo aggregation", expanded=True):
